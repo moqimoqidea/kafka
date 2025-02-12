@@ -24,11 +24,11 @@ import org.apache.kafka.clients.Metadata;
 import org.apache.kafka.clients.MetadataRecoveryStrategy;
 import org.apache.kafka.clients.MockClient;
 import org.apache.kafka.clients.NetworkClient;
-import org.apache.kafka.clients.NodeApiVersions;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.OffsetOutOfRangeException;
 import org.apache.kafka.clients.consumer.internals.events.BackgroundEventHandler;
+import org.apache.kafka.clients.consumer.internals.metrics.AsyncConsumerMetrics;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.KafkaException;
@@ -41,7 +41,6 @@ import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.errors.AuthenticationException;
 import org.apache.kafka.common.errors.DisconnectException;
-import org.apache.kafka.common.errors.RecordTooLargeException;
 import org.apache.kafka.common.errors.SerializationException;
 import org.apache.kafka.common.errors.TopicAuthorizationException;
 import org.apache.kafka.common.header.Header;
@@ -1263,25 +1262,6 @@ public class FetchRequestManagerTest {
     }
 
     /**
-     * Test the case where the client makes a pre-v3 FetchRequest, but the server replies with only a partial
-     * request. This happens when a single message is larger than the per-partition limit.
-     */
-    @Test
-    public void testFetchRequestWhenRecordTooLarge() {
-        try {
-            buildFetcher();
-
-            client.setNodeApiVersions(NodeApiVersions.create(ApiKeys.FETCH.id, (short) 2, (short) 2));
-            makeFetchRequestWithIncompleteRecord();
-            assertThrows(RecordTooLargeException.class, this::collectFetch);
-            // the position should not advance since no data has been returned
-            assertEquals(0, subscriptions.position(tp0).offset);
-        } finally {
-            client.setNodeApiVersions(NodeApiVersions.create());
-        }
-    }
-
-    /**
      * Test the case where the client makes a post KIP-74 FetchRequest, but the server replies with only a
      * partial request. For v3 and later FetchRequests, the implementation of KIP-74 changed the behavior
      * so that at least one message is always returned. Therefore, this case should not happen, and it indicates
@@ -1922,7 +1902,7 @@ public class FetchRequestManagerTest {
                 MetadataRecoveryStrategy.NONE);
 
         ApiVersionsResponse apiVersionsResponse = TestUtils.defaultApiVersionsResponse(
-                400, ApiMessageType.ListenerType.ZK_BROKER);
+                400, ApiMessageType.ListenerType.BROKER);
         ByteBuffer buffer = RequestTestUtils.serializeResponseWithHeader(apiVersionsResponse, ApiKeys.API_VERSIONS.latestVersion(), 0);
 
         selector.delayedReceive(new DelayedReceive(node.idString(), new NetworkReceive(node.idString(), buffer)));
@@ -2552,7 +2532,7 @@ public class FetchRequestManagerTest {
                 new SimpleRecord(null, "value".getBytes()));
 
         // Remove the last record to simulate compaction
-        MemoryRecords.FilterResult result = records.filterTo(tp0, new MemoryRecords.RecordFilter(0, 0) {
+        MemoryRecords.FilterResult result = records.filterTo(new MemoryRecords.RecordFilter(0, 0) {
             @Override
             protected BatchRetentionResult checkBatchRetention(RecordBatch batch) {
                 return new BatchRetentionResult(BatchRetention.DELETE_EMPTY, false);
@@ -2562,7 +2542,7 @@ public class FetchRequestManagerTest {
             protected boolean shouldRetainRecord(RecordBatch recordBatch, Record record) {
                 return record.key() != null;
             }
-        }, ByteBuffer.allocate(1024), Integer.MAX_VALUE, BufferSupplier.NO_CACHING);
+        }, ByteBuffer.allocate(1024), BufferSupplier.NO_CACHING);
         result.outputBuffer().flip();
         MemoryRecords compactedRecords = MemoryRecords.readableRecords(result.outputBuffer());
 
@@ -3633,7 +3613,7 @@ public class FetchRequestManagerTest {
                                      SubscriptionState subscriptionState,
                                      LogContext logContext) {
         buildDependencies(metricConfig, metadataExpireMs, subscriptionState, logContext);
-        Deserializers<K, V> deserializers = new Deserializers<>(keyDeserializer, valueDeserializer);
+        Deserializers<K, V> deserializers = new Deserializers<>(keyDeserializer, valueDeserializer, metrics);
         FetchConfig fetchConfig = new FetchConfig(
                 minBytes,
                 maxBytes,
@@ -3700,7 +3680,7 @@ public class FetchRequestManagerTest {
         properties.setProperty(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, String.valueOf(requestTimeoutMs));
         properties.setProperty(ConsumerConfig.RETRY_BACKOFF_MS_CONFIG, String.valueOf(retryBackoffMs));
         ConsumerConfig config = new ConsumerConfig(properties);
-        networkClientDelegate = spy(new TestableNetworkClientDelegate(time, config, logContext, client, metadata, backgroundEventHandler));
+        networkClientDelegate = spy(new TestableNetworkClientDelegate(time, config, logContext, client, metadata, backgroundEventHandler, true));
     }
 
     private <T> List<Long> collectRecordOffsets(List<ConsumerRecord<T, T>> records) {
@@ -3777,8 +3757,9 @@ public class FetchRequestManagerTest {
                                              LogContext logContext,
                                              KafkaClient client,
                                              Metadata metadata,
-                                             BackgroundEventHandler backgroundEventHandler) {
-            super(time, config, logContext, client, metadata, backgroundEventHandler);
+                                             BackgroundEventHandler backgroundEventHandler,
+                                             boolean notifyMetadataErrorsViaErrorQueue) {
+            super(time, config, logContext, client, metadata, backgroundEventHandler, notifyMetadataErrorsViaErrorQueue, mock(AsyncConsumerMetrics.class));
         }
 
         @Override

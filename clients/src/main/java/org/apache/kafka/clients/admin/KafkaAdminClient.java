@@ -57,6 +57,7 @@ import org.apache.kafka.clients.admin.internals.DescribeTransactionsHandler;
 import org.apache.kafka.clients.admin.internals.FenceProducersHandler;
 import org.apache.kafka.clients.admin.internals.ListConsumerGroupOffsetsHandler;
 import org.apache.kafka.clients.admin.internals.ListOffsetsHandler;
+import org.apache.kafka.clients.admin.internals.ListShareGroupOffsetsHandler;
 import org.apache.kafka.clients.admin.internals.ListTransactionsHandler;
 import org.apache.kafka.clients.admin.internals.PartitionLeaderStrategy;
 import org.apache.kafka.clients.admin.internals.RemoveMembersFromConsumerGroupHandler;
@@ -2504,10 +2505,14 @@ public class KafkaAdminClient extends AdminClient {
             @Override
             AbstractRequest.Builder createRequest(int timeoutMs) {
                 if (!useMetadataRequest) {
+                    if (metadataManager.usingBootstrapControllers() && options.includeFencedBrokers()) {
+                        throw new IllegalArgumentException("Cannot request fenced brokers from controller endpoint");
+                    }
                     return new DescribeClusterRequest.Builder(new DescribeClusterRequestData()
                         .setIncludeClusterAuthorizedOperations(options.includeAuthorizedOperations())
                         .setEndpointType(metadataManager.usingBootstrapControllers() ?
-                                EndpointType.CONTROLLER.id() : EndpointType.BROKER.id()));
+                                EndpointType.CONTROLLER.id() : EndpointType.BROKER.id())
+                        .setIncludeFencedBrokers(options.includeFencedBrokers()));
                 } else {
                     // Since this only requests node information, it's safe to pass true for allowAutoTopicCreation (and it
                     // simplifies communication with older brokers)
@@ -2523,7 +2528,6 @@ public class KafkaAdminClient extends AdminClient {
             void handleResponse(AbstractResponse abstractResponse) {
                 if (!useMetadataRequest) {
                     DescribeClusterResponse response = (DescribeClusterResponse) abstractResponse;
-
                     Errors error = Errors.forCode(response.data().errorCode());
                     if (error != Errors.NONE) {
                         ApiError apiError = new ApiError(error, response.data().errorMessage());
@@ -2568,6 +2572,12 @@ public class KafkaAdminClient extends AdminClient {
                     return false;
                 }
                 if (useMetadataRequest) {
+                    return false;
+                }
+
+                // If unsupportedVersion exception was caused by the option to include fenced brokers (only supported for version 2+)
+                // then we should not fall back to the metadataRequest.
+                if (options.includeFencedBrokers()) {
                     return false;
                 }
 
@@ -2647,6 +2657,7 @@ public class KafkaAdminClient extends AdminClient {
 
             @Override
             void handleResponse(AbstractResponse abstractResponse) {
+                handleNotControllerError(abstractResponse);
                 CreateAclsResponse response = (CreateAclsResponse) abstractResponse;
                 List<AclCreationResult> responses = response.results();
                 Iterator<AclCreationResult> iter = responses.iterator();
@@ -2699,6 +2710,7 @@ public class KafkaAdminClient extends AdminClient {
 
             @Override
             void handleResponse(AbstractResponse abstractResponse) {
+                handleNotControllerError(abstractResponse);
                 DeleteAclsResponse response = (DeleteAclsResponse) abstractResponse;
                 List<DeleteAclsResponseData.DeleteAclsFilterResult> results = response.filterResults();
                 Iterator<DeleteAclsResponseData.DeleteAclsFilterResult> iter = results.iterator();
@@ -2917,6 +2929,7 @@ public class KafkaAdminClient extends AdminClient {
 
             @Override
             public void handleResponse(AbstractResponse abstractResponse) {
+                handleNotControllerError(abstractResponse);
                 IncrementalAlterConfigsResponse response = (IncrementalAlterConfigsResponse) abstractResponse;
                 Map<ConfigResource, ApiError> errors = IncrementalAlterConfigsResponse.fromResponseData(response.data());
                 for (Map.Entry<ConfigResource, KafkaFutureImpl<Void>> entry : futures.entrySet()) {
@@ -3788,6 +3801,15 @@ public class KafkaAdminClient extends AdminClient {
     }
 
     @Override
+    public ListShareGroupOffsetsResult listShareGroupOffsets(final Map<String, ListShareGroupOffsetsSpec> groupSpecs,
+                                                             final ListShareGroupOffsetsOptions options) {
+        SimpleAdminApiFuture<CoordinatorKey, Map<TopicPartition, Long>> future = ListShareGroupOffsetsHandler.newFuture(groupSpecs.keySet());
+        ListShareGroupOffsetsHandler handler = new ListShareGroupOffsetsHandler(groupSpecs, logContext);
+        invokeDriver(handler, future, options.timeoutMs);
+        return new ListShareGroupOffsetsResult(future.all());
+    }
+
+    @Override
     public DescribeClassicGroupsResult describeClassicGroups(final Collection<String> groupIds,
                                                              final DescribeClassicGroupsOptions options) {
         SimpleAdminApiFuture<CoordinatorKey, ClassicGroupDescription> future =
@@ -4072,8 +4094,11 @@ public class KafkaAdminClient extends AdminClient {
     }
 
     private void handleNotControllerError(AbstractResponse response) throws ApiException {
+        // When sending requests directly to the follower controller, it might return NOT_LEADER_OR_FOLLOWER error.
         if (response.errorCounts().containsKey(Errors.NOT_CONTROLLER)) {
             handleNotControllerError(Errors.NOT_CONTROLLER);
+        } else if (metadataManager.usingBootstrapControllers() && response.errorCounts().containsKey(Errors.NOT_LEADER_OR_FOLLOWER)) {
+            handleNotControllerError(Errors.NOT_LEADER_OR_FOLLOWER);
         }
     }
 
@@ -4635,6 +4660,7 @@ public class KafkaAdminClient extends AdminClient {
 
             @Override
             void handleResponse(AbstractResponse response) {
+                handleNotControllerError(response);
                 final DescribeQuorumResponse quorumResponse = (DescribeQuorumResponse) response;
                 if (quorumResponse.data().errorCode() != Errors.NONE.code()) {
                     throw Errors.forCode(quorumResponse.data().errorCode()).exception(quorumResponse.data().errorMessage());
@@ -4822,16 +4848,17 @@ public class KafkaAdminClient extends AdminClient {
                         setHost(endpoint.host()).
                         setPort(endpoint.port())));
                 return new AddRaftVoterRequest.Builder(
-                   new AddRaftVoterRequestData().
-                       setClusterId(options.clusterId().orElse(null)).
-                       setTimeoutMs(timeoutMs).
-                       setVoterId(voterId) .
-                       setVoterDirectoryId(voterDirectoryId).
-                       setListeners(listeners));
+                        new AddRaftVoterRequestData().
+                            setClusterId(options.clusterId().orElse(null)).
+                            setTimeoutMs(timeoutMs).
+                            setVoterId(voterId) .
+                            setVoterDirectoryId(voterDirectoryId).
+                            setListeners(listeners));
             }
 
             @Override
             void handleResponse(AbstractResponse response) {
+                handleNotControllerError(response);
                 AddRaftVoterResponse addResponse = (AddRaftVoterResponse) response;
                 if (addResponse.data().errorCode() != Errors.NONE.code()) {
                     ApiError error = new ApiError(
@@ -4876,6 +4903,7 @@ public class KafkaAdminClient extends AdminClient {
 
             @Override
             void handleResponse(AbstractResponse response) {
+                handleNotControllerError(response);
                 RemoveRaftVoterResponse addResponse = (RemoveRaftVoterResponse) response;
                 if (addResponse.data().errorCode() != Errors.NONE.code()) {
                     ApiError error = new ApiError(
